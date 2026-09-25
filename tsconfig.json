@@ -1,0 +1,22 @@
+{
+	"compilerOptions": {
+		"paths": {
+			"main": ["./main"],
+			"deviceAuthModal": ["./deviceAuthModal"],
+			"helpers/*": ["./helpers/*"]
+		},
+		"inlineSourceMap": true,
+		"inlineSources": true,
+		"module": "ESNext",
+		"target": "ES2019",
+		"allowJs": true,
+		"noImplicitAny": true,
+		"moduleResolution": "bundler",
+		"importHelpers": true,
+		"isolatedModules": true,
+		"strictNullChecks": true,
+		"lib": ["DOM", "ES2019"]
+	},
+	"include": ["**/*.ts"],
+	"exclude": ["backup/**"]
+}

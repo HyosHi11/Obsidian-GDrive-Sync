@@ -1,0 +1,9 @@
+{
+	"id": "obsidian-gdrive-sync",
+	"name": "Obsidian Gdrive Sync",
+	"version": "0.1.0",
+	"minAppVersion": "1.6.0",
+	"description": "Syncs a vault into Google Drive",
+	"author": "HyosHi",
+	"isDesktopOnly": false
+}

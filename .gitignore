@@ -1,0 +1,26 @@
+# vscode
+.vscode 
+
+# Intellij
+*.iml
+.idea
+
+# npm
+node_modules
+
+# Comompiled main.js
+main.js
+
+# Exclude sourcemaps
+*.map
+
+# obsidian
+data.json
+
+# OAuth credentials — copy helpers/googleOAuthConfig.example.ts to
+# helpers/googleOAuthConfig.ts and fill in your own client ID/secret
+
+
+# Exclude OS/IDE files
+.DS_Store
+.vscode

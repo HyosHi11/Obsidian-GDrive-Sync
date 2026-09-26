@@ -39,6 +39,12 @@ interface PluginSettings {
 	 * (pre-vaultId) Google Drive tree has been performed for this vault.
 	 */
 	vaultIdMigrated: boolean;
+	/**
+	 * Drive ids waiting to be deleted that no longer have a path entry in
+	 * `operations`: a note was renamed onto a path whose previous file was
+	 * still queued for deletion (see handleRename).
+	 */
+	pendingDeleteIds: string[];
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
@@ -56,6 +62,7 @@ const DEFAULT_SETTINGS: PluginSettings = {
 	confirmPush: false,
 	ribbonAction: "sync",
 	vaultIdMigrated: false,
+	pendingDeleteIds: [],
 };
 
 export default class ObsidianGoogleDrive extends Plugin {
@@ -73,6 +80,15 @@ export default class ObsidianGoogleDrive extends Plugin {
 	private suppressNextRibbonClick = false;
 	syncing = false;
 	pendingChangesToken?: string;
+	/** Config-folder files written by the current pull (see endSync). */
+	pulledConfigPaths = new Set<string>();
+	/**
+	 * Set when the last access-token refresh failed. Automatic (sync-on-save)
+	 * syncs are paused while it is set; a manual sync still tries again and
+	 * clears it on success.
+	 */
+	private lastRefreshFailed = false;
+	private refreshFailureNoticeAt = 0;
 
 	/**
 	 * Depth counter of vault mutations that the plugin is performing itself
@@ -130,24 +146,22 @@ export default class ObsidianGoogleDrive extends Plugin {
 		}
 
 		checkConnection().then(async (connected) => {
-			if (connected) {
-				try {
-					this.syncing = true;
-					this.ribbonIcon?.addClass("spin");
-					if ((await pull(this, true)) === false) {
-						throw new Error("Unable to complete startup pull.");
-					}
-					await this.endSync();
-				} catch (error) {
-					this.pendingChangesToken = undefined;
-					console.error(
-						"[Obsidian Gdrive Sync] Startup pull error:",
-						error,
-					);
-				} finally {
-					this.syncing = false;
-					this.ribbonIcon?.removeClass("spin");
+			// Claim the lock synchronously: a save-triggered sync can already be
+			// running by the time the connection check resolves.
+			if (!connected || !this.claimSyncLock()) return;
+			try {
+				if ((await pull(this, true)) === false) {
+					throw new Error("Unable to complete startup pull.");
 				}
+				await this.endSync();
+			} catch (error) {
+				this.pendingChangesToken = undefined;
+				console.error(
+					"[Obsidian Gdrive Sync] Startup pull error:",
+					error,
+				);
+			} finally {
+				this.releaseSyncLock();
 			}
 		});
 	}
@@ -165,6 +179,9 @@ export default class ObsidianGoogleDrive extends Plugin {
 			() => {
 				if (!this.settings.syncOnSave) return;
 				if (!this.settings.refreshToken) return;
+				// A revoked token would otherwise fail (and notify) after
+				// every single save; wait for a manual sync to succeed.
+				if (this.lastRefreshFailed) return;
 				if (this.syncing) {
 					this.debouncedSyncOnSave();
 					return;
@@ -372,6 +389,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 			operations: { ...(loaded.operations || {}) },
 			renames: { ...(loaded.renames || {}) },
 			driveIdToPath: { ...(loaded.driveIdToPath || {}) },
+			pendingDeleteIds: [...(loaded.pendingDeleteIds || [])],
 		});
 		if (!this.settings.vaultId) {
 			this.settings.vaultId = randomUUID();
@@ -396,6 +414,11 @@ export default class ObsidianGoogleDrive extends Plugin {
 		// Never upload the long-lived refresh token. It grants full access to
 		// the Drive account and should stay on the device that owns it.
 		delete settings.refreshToken;
+		// The pending-change queues are this device's alone; another device
+		// (or a new one set up from the Drive copy) must not replay them.
+		delete settings.operations;
+		delete settings.renames;
+		delete settings.pendingDeleteIds;
 		return settings;
 	}
 
@@ -448,15 +471,26 @@ export default class ObsidianGoogleDrive extends Plugin {
 					token: access_token,
 					expiresAt: Date.now() + expires_in * 1000,
 				};
+				this.lastRefreshFailed = false;
 				return true;
 			} catch (error) {
 				console.error(
 					"[Obsidian Gdrive Sync] Failed to refresh access token:",
 					error,
 				);
-				new Notice(
-					"Failed to refresh Google Drive access. You may need to reconnect your account in settings.",
-				);
+				// One sync attempt can reach this three times (the pull, the
+				// beforeRequest hook and the 401 hook) and sync-on-save retries
+				// after every save, so throttle the notice and pause automatic
+				// syncs until a manual sync succeeds.
+				this.lastRefreshFailed = true;
+				if (Date.now() - this.refreshFailureNoticeAt > 60_000) {
+					this.refreshFailureNoticeAt = Date.now();
+					new Notice(
+						`Google Drive access could not be refreshed (${
+							error instanceof Error ? error.message : String(error)
+						}). Reconnect your account in settings if this persists.`,
+					);
+				}
 				return false;
 			} finally {
 				this.refreshPromise = null;
@@ -471,6 +505,12 @@ export default class ObsidianGoogleDrive extends Plugin {
 			clientId: this.settings.clientId,
 			clientSecret: this.settings.clientSecret,
 		};
+	}
+
+	/** Called once a fresh token pair has been stored (connect/reconnect). */
+	markAuthRestored() {
+		this.lastRefreshFailed = false;
+		this.refreshFailureNoticeAt = 0;
 	}
 
 	handleCreate(file: TAbstractFile) {
@@ -532,10 +572,29 @@ export default class ObsidianGoogleDrive extends Plugin {
 		if (this.isApplyingRemoteChange()) return;
 		if (!this.settings.renames) this.settings.renames = {};
 
+		if (!this.settings.pendingDeleteIds) this.settings.pendingDeleteIds = [];
+
+		const driveIdForPath = (path: string) =>
+			Object.entries(this.settings.driveIdToPath).find(
+				([_, p]) => p === path,
+			)?.[0];
+
 		// Check if oldPath already has an existing Drive ID
-		const existingDriveId = Object.entries(
-			this.settings.driveIdToPath,
-		).find(([_, p]) => p === oldPath)?.[0];
+		const existingDriveId = driveIdForPath(oldPath);
+
+		// Obsidian also fires a rename for every descendant of a renamed
+		// folder, after the folder's own event. That event has already moved
+		// this entry (see the folder branches below), and handling it a second
+		// time turned a pending "modify"/"create" into a bare "rename" whose
+		// content never got uploaded.
+		const knownAtOldPath =
+			existingDriveId !== undefined ||
+			oldPath in this.settings.operations ||
+			oldPath in this.settings.renames;
+		const knownAtNewPath =
+			driveIdForPath(file.path) !== undefined ||
+			file.path in this.settings.operations;
+		if (!knownAtOldPath && knownAtNewPath) return;
 
 		// Case A: Newly created item that has NOT yet synced to Google Drive
 		if (
@@ -569,6 +628,19 @@ export default class ObsidianGoogleDrive extends Plugin {
 		delete this.settings.renames[oldPath];
 		if (originalPath !== file.path) {
 			this.settings.renames[file.path] = originalPath;
+		}
+
+		// Renaming onto a path whose previous file is still waiting to be
+		// deleted (Obsidian requires deleting A before renaming B to A). The
+		// operation map is keyed by path, so the "delete" below would be
+		// overwritten by this rename and Drive would end up with two files at
+		// the same path. Keep that delete by Drive id instead.
+		if (this.settings.operations[file.path] === "delete") {
+			const staleId = driveIdForPath(file.path);
+			if (staleId && staleId !== existingDriveId) {
+				this.settings.pendingDeleteIds.push(staleId);
+				delete this.settings.driveIdToPath[staleId];
+			}
 		}
 
 		// Update driveIdToPath for the renamed item itself
@@ -718,6 +790,24 @@ export default class ObsidianGoogleDrive extends Plugin {
 		return true;
 	}
 
+	/**
+	 * Claims the sync lock without awaiting first, so two overlapping triggers
+	 * (the sync-on-save timer and a ribbon click, say) can never both start a
+	 * sync. Returns false when a sync is already running.
+	 */
+	claimSyncLock() {
+		if (this.syncing) return false;
+		this.syncing = true;
+		this.ribbonIcon?.addClass("spin");
+		this.drive.clearRootFolderCache();
+		return true;
+	}
+
+	releaseSyncLock() {
+		this.syncing = false;
+		this.ribbonIcon?.removeClass("spin");
+	}
+
 	async startSync() {
 		if (
 			!this.settings.refreshToken ||
@@ -728,13 +818,19 @@ export default class ObsidianGoogleDrive extends Plugin {
 				"Google Drive OAuth credentials are missing. Enter them in plugin settings first.",
 			);
 		}
-		if (!(await checkConnection())) {
-			throw new Error(
-				"You are not connected to the internet, so you cannot sync right now. Please try syncing once you have connection again.",
-			);
+		if (!this.claimSyncLock()) {
+			throw new Error("Google Drive sync is already in progress.");
 		}
-		this.ribbonIcon?.addClass("spin");
-		this.syncing = true;
+		try {
+			if (!(await checkConnection())) {
+				throw new Error(
+					"You are not connected to the internet, so you cannot sync right now. Please try syncing once you have connection again.",
+				);
+			}
+		} catch (error) {
+			this.releaseSyncLock();
+			throw error;
+		}
 		return new Notice("Syncing (0%)", 0);
 	}
 
@@ -744,7 +840,8 @@ export default class ObsidianGoogleDrive extends Plugin {
 		markSynced = true,
 	) {
 		try {
-			if (retainConfigChanges) {
+			const syncedAt = Date.now();
+			if (retainConfigChanges && markSynced) {
 				const configFilesToSync =
 					await this.drive.getConfigFilesToSync();
 				if (!configFilesToSync) {
@@ -753,16 +850,26 @@ export default class ObsidianGoogleDrive extends Plugin {
 					);
 				}
 
+				// Config files are tracked purely by mtime, so once the
+				// watermark moves to `syncedAt` any local config edit made
+				// before it would silently drop out of the next push. Stamp
+				// those files just past the new watermark. (They used to be
+				// stamped *before* the watermark was set, which dropped them.)
+				// Files this pull itself wrote are excluded, otherwise every
+				// device would re-push whatever it had just pulled.
 				await Promise.all(
-					configFilesToSync.map(async (file) =>
-						this.app.vault.adapter.writeBinary(
-							file,
-							await this.app.vault.adapter.readBinary(file),
-							{ mtime: Date.now() },
+					configFilesToSync
+						.filter((file) => !this.pulledConfigPaths.has(file))
+						.map(async (file) =>
+							this.app.vault.adapter.writeBinary(
+								file,
+								await this.app.vault.adapter.readBinary(file),
+								{ mtime: syncedAt + 1 },
+							),
 						),
-					),
 				);
 			}
+			this.pulledConfigPaths.clear();
 
 			if (!this.settings.changesToken) {
 				const changesToken = await this.drive.getChangesStartToken();
@@ -778,22 +885,20 @@ export default class ObsidianGoogleDrive extends Plugin {
 			// Advancing it after a partial/failed sync would hide any remote
 			// change made during the failed run from the next pull.
 			if (markSynced) {
-				this.settings.lastSyncedAt = Date.now();
+				this.settings.lastSyncedAt = syncedAt;
 			}
 			await this.saveSettings();
 		} finally {
 			this.pendingChangesToken = undefined;
-			this.ribbonIcon?.removeClass("spin");
-			this.syncing = false;
+			this.releaseSyncLock();
 			syncNotice?.hide();
 		}
 	}
 
 	async runInitialSync() {
 		if (!(await checkConnection())) return;
+		if (!this.claimSyncLock()) return;
 		try {
-			this.syncing = true;
-			this.ribbonIcon?.addClass("spin");
 			if ((await pull(this, true)) === false) {
 				throw new Error("Unable to complete initial sync.");
 			}
@@ -802,8 +907,7 @@ export default class ObsidianGoogleDrive extends Plugin {
 			this.pendingChangesToken = undefined;
 			console.error("[Obsidian Gdrive Sync] Initial sync error:", error);
 		} finally {
-			this.syncing = false;
-			this.ribbonIcon?.removeClass("spin");
+			this.releaseSyncLock();
 		}
 	}
 
@@ -813,7 +917,10 @@ export default class ObsidianGoogleDrive extends Plugin {
 		this.settings.driveIdToPath = {};
 		this.settings.renames = {};
 		this.settings.operations = {};
+		this.settings.pendingDeleteIds = [];
 		this.accessToken = { token: "", expiresAt: 0 };
+		this.markAuthRestored();
+		this.drive.clearRootFolderCache();
 		await this.saveSettings();
 	}
 }
@@ -904,6 +1011,7 @@ class SettingsTab extends PluginSettingTab {
 									expiresAt:
 										Date.now() + tokens.expires_in * 1000,
 								};
+								this.plugin.markAuthRestored();
 
 								const changesToken =
 									await this.plugin.drive.getChangesStartToken();

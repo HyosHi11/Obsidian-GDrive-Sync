@@ -345,6 +345,14 @@ export const push = async (
 		const failedOperations = new Set<string>();
 		const staleSkipped = new Set<string>();
 		let configSyncFailed = false;
+		let idDeleteFailed = false;
+		// mtime of each file at the moment its content was read for upload,
+		// so the cleanup below can tell whether it was saved again meanwhile.
+		const uploadedMtimes = new Map<string, number>();
+		const readForUpload = async (file: TFile) => {
+			uploadedMtimes.set(file.path, file.stat.mtime);
+			return new Blob([await vault.readBinary(file)]);
+		};
 		const hasFailedConfigParent = (path: string) => {
 			let parent = path.split("/").slice(0, -1).join("/");
 			while (parent) {
@@ -499,6 +507,33 @@ export const push = async (
 			});
 		}
 
+		// Deletes kept by Drive id rather than by path (a note renamed onto a
+		// path whose previous file was still waiting to be deleted, see
+		// handleRename). They have no path entry, so flush them separately.
+		const pendingDeleteIds = [...(t.settings.pendingDeleteIds || [])];
+		if (pendingDeleteIds.length) {
+			const results = await t.drive.batchDelete(pendingDeleteIds);
+			const remaining = results
+				? pendingDeleteIds.filter((id) => !results[id])
+				: pendingDeleteIds;
+			// Ids queued by a rename made while this push was running are
+			// kept as well.
+			t.settings.pendingDeleteIds = Array.from(
+				new Set([
+					...remaining,
+					...(t.settings.pendingDeleteIds || []).filter(
+						(id) => !pendingDeleteIds.includes(id),
+					),
+				]),
+			);
+			if (remaining.length) {
+				idDeleteFailed = true;
+				if (!options?.silent) {
+					new Notice("An error occurred deleting Google Drive files.");
+				}
+			}
+		}
+
 		syncNotice.setMessage("Syncing (33%)");
 
 		if (renames.length) {
@@ -565,20 +600,25 @@ export const push = async (
 							);
 							if (!result) failedOperations.add(folder.path);
 
-							// Update descendant properties.path on Google Drive
+							// Update descendant properties.path on Google Drive.
+							// Batched: a folder with hundreds of notes used to
+							// issue these one request at a time.
 							const newPrefix = folder.path + "/";
-							for (const [id, p] of Object.entries(
+							const descendants = Object.entries(
 								t.settings.driveIdToPath,
-							)) {
-								if (p.startsWith(newPrefix)) {
-									const descendantResult =
-										await t.drive.updateFileMetadata(id, {
-											properties: { path: p },
-										});
-									if (!descendantResult) {
-										failedOperations.add(folder.path);
-									}
-								}
+							).filter(([, p]) => p.startsWith(newPrefix));
+							const descendantResults = await batchAsyncs(
+								descendants.map(
+									([id, p]) =>
+										() =>
+											t.drive.updateFileMetadata(id, {
+												properties: { path: p },
+											}),
+								),
+								5,
+							);
+							if (descendantResults.some((result) => !result)) {
+								failedOperations.add(folder.path);
 							}
 						}),
 					);
@@ -736,7 +776,7 @@ export const push = async (
 						}
 						const existingId = await t.drive.updateFile(
 							remote.id,
-							new Blob([await vault.readBinary(note)]),
+							await readForUpload(note),
 							{
 								name: note.name,
 								properties: { path: note.path },
@@ -760,7 +800,7 @@ export const push = async (
 						return;
 					}
 					const id = await t.drive.uploadFile(
-						new Blob([await vault.readBinary(note)]),
+						await readForUpload(note),
 						note.name,
 						note.parent ? pathsToIds[note.parent.path] : undefined,
 						{
@@ -860,7 +900,7 @@ export const push = async (
 					// SAFETY CHECK: If the file doesn't have a Drive ID yet, upload it as a new file instead of throwing a 404
 					if (!driveId) {
 						const newId = await t.drive.uploadFile(
-							new Blob([await vault.readBinary(file)]),
+							await readForUpload(file),
 							file.name,
 							file.parent
 								? pathToId[file.parent.path]
@@ -880,9 +920,9 @@ export const push = async (
 						return;
 					}
 
-					let id = await t.drive.updateFile(
+					const update = await t.drive.tryUpdateFile(
 						driveId,
-						new Blob([await vault.readBinary(file)]),
+						await readForUpload(file),
 						{
 							name: file.name,
 							properties: { path: file.path },
@@ -890,8 +930,19 @@ export const push = async (
 						},
 						parentParams,
 					);
+					if (!update.ok && update.status !== 404) {
+						// Rate limit, 5xx, timeout: the Drive object is still
+						// there, so uploading a "new" copy would duplicate it.
+						// Leave the operation queued for the next sync.
+						failedOperations.add(file.path);
+						if (!options?.silent) {
+							new Notice(`Failed to upload ${file.path}.`);
+						}
+						return;
+					}
+					let id = update.ok ? update.value : undefined;
 					if (!id) {
-						// If the remote file was deleted, re-upload as new file
+						// The remote file is gone (404): re-upload as a new file
 						if (
 							file.parent &&
 							file.parent.path !== "/" &&
@@ -901,7 +952,7 @@ export const push = async (
 							return;
 						}
 						id = await t.drive.uploadFile(
-							new Blob([await vault.readBinary(file)]),
+							await readForUpload(file),
 							file.name,
 							file.parent && file.parent.path !== "/"
 								? pathToId[file.parent.path]
@@ -912,6 +963,7 @@ export const push = async (
 							},
 						);
 						if (id) {
+							delete t.settings.driveIdToPath[driveId];
 							t.settings.driveIdToPath[id] = file.path;
 							pathToId[file.path] = id;
 						} else if (!options?.silent) {
@@ -1006,69 +1058,74 @@ export const push = async (
 			}
 		}
 
-		await batchAsyncs(
-			configFilesToSync.map((path) => async () => {
-				if (hasFailedConfigParent(path)) {
-					configSyncFailed = true;
-					failedOperations.add(path);
-					return;
-				}
-				const content =
-					path === settingsFilePath
-						? new Blob([
-								JSON.stringify(t.getSettingsForSync(), null, 2),
-							])
-						: new Blob([await adapter.readBinary(path)]);
-				if (pathsToIds[path]) {
-					const result = await t.drive.updateFile(
-						pathsToIds[path],
-						content,
-						{ modifiedTime: new Date().toISOString() },
-					);
-					if (!result) {
-						configSyncFailed = true;
-						failedOperations.add(path);
-					}
-					return;
-				}
-
-				const id = await t.drive.uploadFile(
+		const uploadConfigFile = async (path: string, content: Blob) => {
+			if (hasFailedConfigParent(path)) {
+				configSyncFailed = true;
+				failedOperations.add(path);
+				return;
+			}
+			if (pathsToIds[path]) {
+				const result = await t.drive.updateFile(
+					pathsToIds[path],
 					content,
-					fileNameFromPath(path),
-					pathsToIds[path.split("/").slice(0, -1).join("/")],
 					{
-						properties: { path, config: "true" },
+						name: fileNameFromPath(path),
 						modifiedTime: new Date().toISOString(),
 					},
 				);
-				if (!id) {
+				if (!result) {
 					configSyncFailed = true;
 					failedOperations.add(path);
-					if (!options?.silent) {
-						return new Notice(
-							"An error occurred creating Google Drive config files.",
-						);
-					}
-					return;
 				}
-
-				t.settings.driveIdToPath[id] = path;
-				pathsToIds[path] = id;
-			}),
-		);
-
-		const settingsFileId = pathsToIds[settingsFilePath];
-		if (settingsFileId) {
-			const result = await t.drive.updateFile(
-				settingsFileId,
-				new Blob([JSON.stringify(t.getSettingsForSync(), null, 2)]),
-				{ modifiedTime: new Date().toISOString() },
-			);
-			if (!result) {
-				configSyncFailed = true;
-				failedOperations.add(settingsFilePath);
+				return;
 			}
-		}
+
+			const parentPath = path.split("/").slice(0, -1).join("/");
+			const parentId = parentPath ? pathsToIds[parentPath] : undefined;
+			if (parentPath && !parentId) {
+				// Without a parent id uploadFile would fall back to the vault
+				// root on Drive and misplace the file.
+				configSyncFailed = true;
+				failedOperations.add(path);
+				return;
+			}
+			const id = await t.drive.uploadFile(
+				content,
+				fileNameFromPath(path),
+				parentId,
+				{
+					properties: { path, config: "true" },
+					modifiedTime: new Date().toISOString(),
+				},
+			);
+			if (!id) {
+				configSyncFailed = true;
+				failedOperations.add(path);
+				if (!options?.silent) {
+					new Notice(
+						"An error occurred creating Google Drive config files.",
+					);
+				}
+				return;
+			}
+
+			t.settings.driveIdToPath[id] = path;
+			pathsToIds[path] = id;
+		};
+
+		await batchAsyncs(
+			configFilesToSync
+				// This plugin's own data.json is uploaded once, further down,
+				// after the queue has been cleaned up; it used to be uploaded
+				// here and then again immediately afterwards.
+				.filter((path) => path !== settingsFilePath)
+				.map((path) => async () => {
+					await uploadConfigFile(
+						path,
+						new Blob([await adapter.readBinary(path)]),
+					);
+				}),
+		);
 
 		// Clear only the operations/renames that this run handled successfully.
 		// Anything recorded by a user edit while the push was running is left
@@ -1076,9 +1133,20 @@ export const push = async (
 		// silently discarded.
 		for (const [path, operation] of operations) {
 			if (failedOperations.has(path)) continue;
-			if (t.settings.operations[path] === operation) {
-				delete t.settings.operations[path];
+			if (t.settings.operations[path] !== operation) continue;
+			// A save that landed while this file was uploading leaves the
+			// operation unchanged ("modify" stays "modify"), so also compare
+			// the mtime that was read for the upload with the current one.
+			const uploadedMtime = uploadedMtimes.get(path);
+			const current = vault.getFileByPath(path);
+			if (
+				uploadedMtime !== undefined &&
+				current &&
+				current.stat.mtime !== uploadedMtime
+			) {
+				continue;
 			}
+			delete t.settings.operations[path];
 		}
 		for (const [path, original] of Object.entries(renamesSnapshot)) {
 			if (failedOperations.has(path)) continue;
@@ -1087,13 +1155,23 @@ export const push = async (
 			}
 		}
 		await t.saveSettings();
+
+		// Upload this plugin's settings exactly once, now that the handled
+		// operations are cleared and every new Drive id is in the map, so the
+		// copy on Drive (which a new device starts from) is consistent.
+		await uploadConfigFile(
+			settingsFilePath,
+			new Blob([JSON.stringify(t.getSettingsForSync(), null, 2)]),
+		);
+
 		if (configSyncFailed) {
 			throw new Error(
 				"One or more Obsidian configuration files failed to sync.",
 			);
 		}
 
-		const pushedSuccessfully = failedOperations.size === 0;
+		const pushedSuccessfully =
+			failedOperations.size === 0 && !idDeleteFailed;
 		await t.endSync(syncNotice, false, pushedSuccessfully);
 
 		if (staleSkipped.size) {

@@ -1172,6 +1172,49 @@ See section 6 for details.
 
 ---
 
+### 5.16 Sync robustness fixes (retry, deletion, rename and config edge cases)
+- **Uploads are retried.** `helpers/ky.ts` now retries POST/PATCH as well as
+  GET, and treats 403 (Drive's rate-limit status) and 429/5xx as retryable
+  with exponential backoff. Previously a single rate-limited upload failed the
+  sync outright.
+- **A failed PATCH no longer duplicates the file.** `push.ts` uses
+  `drive.tryUpdateFile`, which keeps the HTTP status, and only re-uploads a
+  "new" copy after a 404. A transient error leaves the operation queued.
+- **Preserved edits survive folder deletions.** When a folder is deleted on
+  Drive but a note inside it has an unsynced local edit, the folder is kept
+  (it used to be trashed with the edit inside) and queued as a `create` so the
+  next push recreates it; a retained folder used to have no Drive id, which
+  made every upload into it fail forever.
+- **Delete-then-rename onto the same path.** `handleRename` keeps the pending
+  delete by Drive id (`settings.pendingDeleteIds`, flushed by push) instead of
+  letting the rename overwrite it, so Drive no longer ends up with two files
+  at one path.
+- **Folder renames fire one event per descendant.** `handleRename` now
+  recognises a child event whose entry the folder's own event already moved,
+  instead of downgrading a pending `modify`/`create` to a bare `rename`.
+- **A pending local rename is not undone by a remote edit.** `pull.ts` no
+  longer renames the local file back to the stale remote path; the remote
+  content is applied to the renamed local file and the push then moves the
+  Drive object. Remote renames are applied shallowest-first.
+- **Config edits survive a pull.** `endSync` stamped changed config files
+  *before* moving the watermark, so a hotkey/theme/plugin-setting change made
+  before a startup or manual pull was never pushed. The stamp is now placed
+  just past the new watermark and excludes the files the pull itself wrote
+  (`pulledConfigPaths`).
+- **A save during an upload is not lost.** Push records each file's mtime at
+  read time and keeps the operation when the file changed meanwhile.
+- **Single sync lock.** `startSync`/`claimSyncLock` claim `syncing` before any
+  `await`, so the sync-on-save timer and a ribbon click can no longer run two
+  pushes at once.
+- **Auth failure back-off.** A failed token refresh pauses sync-on-save and
+  throttles the notice to once a minute; the refresh error now includes
+  Google's error code (e.g. `invalid_grant`).
+- **Efficiency.** The root folder id is cached per sync (it was one Drive
+  search per root-level file); descendant `properties.path` updates on a
+  folder rename are batched; this plugin's `data.json` is uploaded once per
+  push instead of twice, after the queue is cleaned, and without the
+  device-local queues; modified binaries keep a correct mimeType.
+
 ## 6. Mobile (Android / iOS) compatibility
 
 `manifest.json` declares `isDesktopOnly: false`, so the plugin runs inside

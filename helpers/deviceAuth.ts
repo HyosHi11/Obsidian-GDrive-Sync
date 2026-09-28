@@ -133,7 +133,22 @@ export async function refreshAccessTokenWithRefreshToken(
 	});
 
 	if (!response.ok) {
-		throw new Error(`Failed to refresh access token: ${response.status}`);
+		// Surface Google's error code (e.g. invalid_grant when the token was
+		// revoked) so the user is told why instead of just an HTTP status.
+		let detail = "";
+		try {
+			const body = (await response.json()) as TokenErrorResponse;
+			detail = [body.error, body.error_description]
+				.filter(Boolean)
+				.join(": ");
+		} catch {
+			// Not a JSON body; the status alone will have to do.
+		}
+		throw new Error(
+			`Failed to refresh access token (HTTP ${response.status}${
+				detail ? `, ${detail}` : ""
+			})`,
+		);
 	}
 
 	return response.json();

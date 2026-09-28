@@ -45,6 +45,10 @@ export const pull = async (
 			t.pendingChangesToken = undefined;
 		};
 
+		// Config files written by this pull are remembered so endSync does not
+		// mistake them for local edits (see endSync).
+		t.pulledConfigPaths.clear();
+
 		if (!t.accessToken.token) await t.refreshAccessToken();
 
 		// Make sure a tree created before vaultId scoping is adopted instead
@@ -136,6 +140,27 @@ export const pull = async (
 			]),
 		);
 
+		// A local rename that has not been pushed yet wins over the stale
+		// remote path: the push will move the Drive object. A folder rename
+		// only records the folder itself in `renames`, so check every ancestor.
+		const hasPendingLocalRename = (localPath: string | undefined) => {
+			if (!localPath) return false;
+			const renames = t.settings.renames || {};
+			const parts = localPath.split("/");
+			for (let i = parts.length; i > 0; i--) {
+				if (renames[parts.slice(0, i).join("/")]) return true;
+			}
+			return false;
+		};
+
+		// Apply shallowest paths first so a renamed folder exists locally
+		// before the renames of the notes inside it are attempted.
+		recentlyModified.sort(
+			(a, b) =>
+				(a.properties?.path?.split("/").length ?? 0) -
+				(b.properties?.path?.split("/").length ?? 0),
+		);
+
 		// Handle remote renames: If a Drive ID is already mapped to an old path,
 		// rename the local file in Obsidian to keep Obsidian's internal history and links intact.
 		const failedRemoteRenames = new Set<string>();
@@ -182,6 +207,9 @@ export const pull = async (
 
 			const oldPath = t.settings.driveIdToPath[remoteFile.id];
 			if (!oldPath || oldPath === newPath) continue;
+			// `oldPath` is where this device moved the file; renaming it back
+			// to the remote path would silently undo the user's own rename.
+			if (hasPendingLocalRename(oldPath)) continue;
 
 			const localAbstractFile = vault.getAbstractFileByPath(oldPath);
 			if (localAbstractFile) {
@@ -217,6 +245,7 @@ export const pull = async (
 		const updateMap = () => {
 			recentlyModified.forEach(({ id, properties }) => {
 				if (failedRemoteRenames.has(id)) return;
+				if (hasPendingLocalRename(t.settings.driveIdToPath[id])) return;
 				if (properties?.path) {
 					pathToId[properties.path] = id;
 				}
@@ -230,6 +259,7 @@ export const pull = async (
 		updateMap();
 
 		const deleteFiles = async () => {
+			const preservedPaths = new Set<string>();
 			const deletedFiles = deletions
 				.filter((file) => file instanceof TFile)
 				.filter((file: TFile) => {
@@ -239,25 +269,42 @@ export const pull = async (
 						// it to be re-uploaded on the next push, rather than
 						// deleting it and losing the edit.
 						t.settings.operations[file.path] = "create";
+						preservedPaths.add(file.path);
 						return false;
 					}
 					return true;
 				}) as TFile[];
 
-			const deletionPaths = deletions.map((file) => file?.path);
+			// Paths that are really going away. Preserved files are excluded
+			// so their parent folders survive as well; previously the folder
+			// was trashed with the preserved edit still inside it.
+			const deletionPaths = new Set(deletions.map((file) => file.path));
+			preservedPaths.forEach((path) => deletionPaths.delete(path));
 
+			const isFullyDeleted = (folder: TFolder): boolean =>
+				folder.children.every(
+					(child) =>
+						deletionPaths.has(child.path) &&
+						(!(child instanceof TFolder) || isFullyDeleted(child)),
+				);
+
+			const retainedFolders: TFolder[] = [];
 			const deletedFolders = deletions
 				.filter((folder) => folder instanceof TFolder)
 				.filter((folder: TFolder) => {
-					if (
-						folder.children.find(
-							({ path }) => !deletionPaths.includes(path),
-						)
-					) {
-						return false;
-					}
-					return true;
+					if (isFullyDeleted(folder)) return true;
+					retainedFolders.push(folder);
+					return false;
 				}) as TFolder[];
+
+			// A retained folder no longer exists on Drive and its id is dropped
+			// at the end of the pull. Queue it as a create so the next push
+			// recreates it; otherwise every note left inside it would fail to
+			// upload forever because its parent has no Drive id.
+			for (const folder of retainedFolders) {
+				t.settings.operations[folder.path] = "create";
+				if (t.settings.renames) delete t.settings.renames[folder.path];
+			}
 
 			const results = await t.drive.deleteFilesMinimumOperations([
 				...deletedFolders,
@@ -279,6 +326,7 @@ export const pull = async (
 			const newFolders = recentlyModified.filter(
 				({ id, mimeType, properties }) =>
 					!failedRemoteRenames.has(id) &&
+					!hasPendingLocalRename(t.settings.driveIdToPath[id]) &&
 					mimeType === folderMimeType &&
 					Boolean(properties?.path),
 			);
@@ -330,20 +378,19 @@ export const pull = async (
 			const results = await batchAsyncs(
 				newNotes.map((file: FileMetadata) => async () => {
 					// A local rename that has not been pushed yet means the
-					// remote path is stale. Downloading it here would resurrect
-					// the old path next to the renamed file.
-					const pendingRenameTarget = Object.entries(
-						t.settings.renames || {},
-					).find(
-						([, original]) => original === file.properties.path,
-					)?.[0];
-					if (pendingRenameTarget) return;
+					// remote path is stale. Apply the Drive content to the
+					// renamed local file instead of resurrecting the old path
+					// next to it (and instead of dropping the remote edit).
+					const mappedPath = t.settings.driveIdToPath[file.id];
+					const localPath =
+						mappedPath && hasPendingLocalRename(mappedPath)
+							? mappedPath
+							: file.properties.path;
 
 					const localFile =
-						vault.getFileByPath(file.properties.path) ||
-						(await adapter.exists(file.properties.path));
-					const operation =
-						t.settings.operations[file.properties.path];
+						vault.getFileByPath(localPath) ||
+						(await adapter.exists(localPath));
+					const operation = t.settings.operations[localPath];
 
 					completed++;
 
@@ -355,8 +402,7 @@ export const pull = async (
 						const localMtime = toMilliseconds(
 							localFile instanceof TFile
 								? localFile.stat.mtime
-								: (await adapter.stat(file.properties.path))
-										?.mtime,
+								: (await adapter.stat(localPath))?.mtime,
 						);
 						const remoteMtime = Date.parse(file.modifiedTime);
 						if (
@@ -366,11 +412,11 @@ export const pull = async (
 						) {
 							return;
 						}
-						delete t.settings.operations[file.properties.path];
+						delete t.settings.operations[localPath];
 					}
 
 					if (localFile && operation === "create") {
-						t.settings.operations[file.properties.path] = "modify";
+						t.settings.operations[localPath] = "modify";
 						return;
 					}
 
@@ -378,7 +424,7 @@ export const pull = async (
 
 					if (!content) {
 						new Notice(
-							"An error occurred fetching Google Drive files.",
+							`Could not download ${file.properties.path} from Google Drive.`,
 						);
 						return false;
 					}
@@ -392,18 +438,17 @@ export const pull = async (
 					);
 
 					if (localFile instanceof TFile) {
-						return t.modifyFile(
-							localFile,
-							content,
-							file.modifiedTime,
-						);
+						await t.modifyFile(localFile, content, file.modifiedTime);
+					} else {
+						await t.upsertFile(localPath, content, file.modifiedTime);
 					}
-
-					return t.upsertFile(
-						file.properties.path,
-						content,
-						file.modifiedTime,
-					);
+					// Config files are tracked by mtime alone; remember which
+					// ones this pull wrote so endSync does not re-flag them
+					// as local edits.
+					if (localPath.startsWith(vault.configDir + "/")) {
+						t.pulledConfigPaths.add(localPath);
+					}
+					return true;
 				}),
 			);
 			if (results.some((result) => result === false)) return false;

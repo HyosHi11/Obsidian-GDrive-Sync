@@ -213,6 +213,7 @@ export const reset = async (t: ObsidianGoogleDrive) => {
 		await t.endSync(syncNotice);
 		t.settings.operations = {};
 		t.settings.renames = {};
+		t.settings.pendingDeleteIds = [];
 		await t.saveSettings();
 
 		new Notice("Reset complete.");

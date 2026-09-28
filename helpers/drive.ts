@@ -219,7 +219,17 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		) as FileMetadata[];
 	};
 
-	const getRootFolderId = async () => {
+	// The root folder id is needed for every root-level upload or rename and
+	// cannot change during a sync, so it is looked up once and shared by all
+	// concurrent callers (the promise is cached, not just the id). It used to
+	// cost one Drive search per root-level file. `clearRootFolderCache` is
+	// called whenever a sync starts and when the account is disconnected.
+	let rootFolderIdPromise: Promise<string | undefined> | undefined;
+	const clearRootFolderCache = () => {
+		rootFolderIdPromise = undefined;
+	};
+
+	const lookupRootFolderId = async () => {
 		const files = await searchFiles(
 			{
 				matches: [{ properties: { obsidian: "vault" } }],
@@ -247,6 +257,23 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		} else {
 			return files[0].id as string;
 		}
+	};
+
+	const getRootFolderId = () => {
+		if (!rootFolderIdPromise) {
+			rootFolderIdPromise = lookupRootFolderId().then(
+				(id) => {
+					// Never cache a failed lookup, so the next caller retries.
+					if (!id) rootFolderIdPromise = undefined;
+					return id;
+				},
+				(error) => {
+					rootFolderIdPromise = undefined;
+					throw error;
+				},
+			);
+		}
+		return rootFolderIdPromise;
 	};
 
 	const createFolder = async ({
@@ -396,7 +423,12 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		// without it the updated file would fall out of the vaultId-scoped queries.
 		newMetadata.properties.vaultId = t.settings.vaultId;
 
-		const mimeType = newContent.type || "text/markdown";
+		// Callers pass untyped Blobs, so derive the type from the file name
+		// (or path) being written; defaulting to text/markdown mislabelled
+		// every modified image or PDF on Drive.
+		const mimeType =
+			newContent.type ||
+			getMimeType(newMetadata.name || newMetadata.properties.path || "");
 		const boundary =
 			"-------ObsidianGDrive" + Math.random().toString(36).substring(2);
 		const delimiter = `\r\n--${boundary}\r\n`;
@@ -843,6 +875,25 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		};
 	};
 
+	// Same contract as withErrorHandling, but a failure keeps the HTTP status
+	// so the caller can tell "the Drive object is gone" (404) apart from a
+	// transient error that must not be treated as a deletion.
+	const withErrorStatus = <Args extends unknown[], Result>(
+		fn: (...args: Args) => Promise<Result>,
+	) => {
+		return async (
+			...args: Args
+		): Promise<
+			{ ok: true; value: Result } | { ok: false; status?: number }
+		> => {
+			try {
+				return { ok: true, value: await fn(...args) };
+			} catch (error) {
+				return { ok: false, status: getErrorStatus(error) };
+			}
+		};
+	};
+
 	return {
 		paginateFiles: withErrorHandling(paginateFiles),
 		searchFiles: withErrorHandling(searchFiles),
@@ -850,6 +901,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		createFolder: withErrorHandling(createFolder),
 		uploadFile: withErrorHandling(uploadFile),
 		updateFile: withErrorHandling(updateFile),
+		tryUpdateFile: withErrorStatus(updateFile),
 		updateFileMetadata: withErrorHandling(updateFileMetadata),
 		deleteFile: withErrorHandling(deleteFile),
 		getFile,
@@ -866,6 +918,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 		),
 		getConfigFilesToSync: withErrorHandling(getConfigFilesToSync),
 		ensureVaultMigrated: withErrorHandling(ensureVaultMigrated),
+		clearRootFolderCache,
 	};
 };
 
